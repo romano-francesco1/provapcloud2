@@ -185,6 +185,7 @@ git clone git@github.com:SaraGallii/ProgettoPervasiveCloud.git
 gcloud app deploy
 gcloud app browse
 
+prova push
 
 # per aggiornare
 git pull ProgettoPervasiveCloud
