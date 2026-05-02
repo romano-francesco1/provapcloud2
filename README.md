@@ -75,14 +75,17 @@ server/
 client_iot.py
 
 -----------------------------------------------------
+# COMANDI PER CLOUD SHELL
 
-COMANDI PER CLOUD SHELL
-
+PER SELEZIONARE IL PROGETTO:
 gcloud projects list
 gcloud config set project PROJECT_ID
 
+PER CLONARE IL REPOSITORY: 
 cd ~
 git clone https://github.com/romano-francesco1/provapcloud2.git
+
+PER AGGIORNARE I PROGRAMMI MODIFICATI: 
 cd provapcloud2
 git pull
 
