@@ -103,3 +103,7 @@ find . -maxdepth 4 -type d -name ".git" -print | sed 's/\/\.git$//' | while read
     rm -rf "$repo_clean"
   fi
 done
+
+------------------------
+
+gcloud org-policies describe constraints/iam.disableServiceAccountCreation --project=progetto-pcloud-2
