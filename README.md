@@ -89,6 +89,11 @@ PER AGGIORNARE I PROGRAMMI MODIFICATI:
 cd provapcloud2
 git pull
 
+PER ESEGUIRE IL PROGRAMMA:
+cd provapcloud2
+gcloud services enable appengine.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com
+
+
 # Questo cancella le cartelle delle repo Git dentro ~ (irreversibile).
 cd ~
 find . -maxdepth 4 -type d -name ".git" -print | sed 's/\/\.git$//' | while read -r repo; do
