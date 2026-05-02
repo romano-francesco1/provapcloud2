@@ -1,6 +1,6 @@
 runtime: python39
 
 handlers:
-  - url: '/.*'
-    secure: always
-    script: auto
+- url: /.*
+  secure: always
+  script: auto

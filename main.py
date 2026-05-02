@@ -42,10 +42,6 @@ def _doc_path(user, session_id, sensor, timestamp_ms_str):
           .collection("readings").document(timestamp_ms_str)
     )
 
-@app.route("/health")
-def health():
-    return "ok", 200
-
 # ===========================
 # (PUNTO 2) Ingest API
 # ===========================
