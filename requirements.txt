@@ -1,6 +1,5 @@
-requests
-flask
-google-cloud-firestore
-google-cloud-storage
-python-telegram-bot
-gunicorn
+Flask>=2.3,<4
+gunicorn>=21,<23
+google-cloud-firestore>=2.13,<3
+google-api-core>=2.11,<3
+requests>=2.31,<3

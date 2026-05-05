@@ -1,36 +1,56 @@
+import argparse
 import csv
 import os
 import sys
 import time
 import threading
+from datetime import datetime, timezone
+from typing import Any, Dict, Tuple
+
 import requests
 
-# === Config ===
-SERVER_URL = "https://<YOUR_PROJECT_ID>.ey.r.appspot.com/data"
-
-SENSOR_CONFIGS = {
-    # filename : (sensor_name, interval_seconds)
-    "wrist_acc.csv": ("ACC", 1/32),   # 32 Hz  [2](https://coopservice-my.sharepoint.com/personal/francesco_romano_coopservice_it/Documents/File%20di%20Microsoft%20Copilot%20Chat/to_deploy.txt)
-    "wrist_bvp.csv": ("BVP", 1/64),   # 64 Hz  [2](https://coopservice-my.sharepoint.com/personal/francesco_romano_coopservice_it/Documents/File%20di%20Microsoft%20Copilot%20Chat/to_deploy.txt)
-    "wrist_eda.csv": ("EDA", 1/4),    # 4 Hz   [2](https://coopservice-my.sharepoint.com/personal/francesco_romano_coopservice_it/Documents/File%20di%20Microsoft%20Copilot%20Chat/to_deploy.txt)
-    "wrist_hr.csv":  ("HR", 1.0),     # 1 Hz   [2](https://coopservice-my.sharepoint.com/personal/francesco_romano_coopservice_it/Documents/File%20di%20Microsoft%20Copilot%20Chat/to_deploy.txt)
-    "wrist_ibi.csv": ("IBI", 0.8),    # per evento; simulazione (come tuo script) [2](https://coopservice-my.sharepoint.com/personal/francesco_romano_coopservice_it/Documents/File%20di%20Microsoft%20Copilot%20Chat/to_deploy.txt)
-    "wrist_skin_temperature.csv": ("TEMP", 1/4) # 4 Hz [2](https://coopservice-my.sharepoint.com/personal/francesco_romano_coopservice_it/Documents/File%20di%20Microsoft%20Copilot%20Chat/to_deploy.txt)
+# filename : (sensor_name, interval_seconds)
+SENSOR_CONFIGS: Dict[str, Tuple[str, float]] = {
+    "wrist_acc.csv": ("ACC", 1/32),   # 32 Hz
+    "wrist_bvp.csv": ("BVP", 1/64),   # 64 Hz
+    "wrist_eda.csv": ("EDA", 1/4),    # 4 Hz
+    "wrist_hr.csv":  ("HR", 1.0),     # 1 Hz
+    "wrist_ibi.csv": ("IBI", 0.8),    # simulazione
+    "wrist_skin_temperature.csv": ("TEMP", 1/4),  # 4 Hz
 }
 
-SCAN_EVERY_SECONDS = 5
+SCAN_EVERY_SECONDS_DEFAULT = 5
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _to_number_if_possible(v: Any) -> Any:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "":
+        return None
+    try:
+        # int se possibile, altrimenti float
+        if s.isdigit():
+            return int(s)
+        return float(s)
+    except Exception:
+        return v
 
 
 class FatigueSetClientManager:
     """
-    Predisposto per futuro:
-    - più sessioni contemporanee
-    - più utenti contemporanei
+    - più sessioni/utenti contemporanei
     - inserimento dinamico di nuove cartelle durante l'esecuzione
     """
-    def __init__(self, server_url: str):
-        self.server_url = server_url
-        self.started_roots = set()  # evita doppi avvii
+    def __init__(self, server_url: str, timeout_s: int = 5):
+        self.server_url = server_url.rstrip("/")
+        self.started_roots = set()
+        self.timeout_s = timeout_s
+        self.http = requests.Session()
 
     def _infer_user_session(self, file_path: str):
         parts = file_path.split(os.sep)
@@ -44,27 +64,27 @@ class FatigueSetClientManager:
         print(f"[START] user={user} session={session} sensor={sensor_name} file={file_path}")
 
         try:
-            with open(file_path, "r", newline="") as f:
+            with open(file_path, "r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     ts = row.pop("timestamp", None)
                     if ts is None:
-                        # se manca timestamp, generiamo uno "now" in ms
-                        ts = int(time.time() * 1000)
+                        ts = _now_ms()
 
                     payload = {
                         "user": user,
                         "session": session,
                         "sensor": sensor_name,
                         "timestamp": ts,
-                        "data": row
+                        "data": {k: _to_number_if_possible(v) for k, v in row.items()},
                     }
 
                     try:
-                        requests.post(self.server_url, json=payload, timeout=3)
-                    except Exception:
-                        # se server temporaneamente non disponibile, ignoriamo
-                        pass
+                        r = self.http.post(self.server_url, json=payload, timeout=self.timeout_s)
+                        if r.status_code != 200:
+                            print(f"[WARN] HTTP {r.status_code}: {r.text[:200]}")
+                    except Exception as e:
+                        print(f"[WARN] POST failed: {e}")
 
                     time.sleep(interval)
 
@@ -73,12 +93,12 @@ class FatigueSetClientManager:
         except Exception as e:
             print(f"[ERR] errore stream {file_path}: {e}")
 
-    def monitor_directory(self, base_dir: str):
+    def monitor_directory(self, base_dir: str, scan_every_seconds: int = SCAN_EVERY_SECONDS_DEFAULT):
+        base_dir = os.path.abspath(base_dir)
         print(f"[MONITOR] in ascolto su: {base_dir}")
 
         while True:
             for root, _, files in os.walk(base_dir):
-                # Se la cartella contiene almeno uno dei file sensore
                 if any(fn in SENSOR_CONFIGS for fn in files):
                     if root not in self.started_roots:
                         self.started_roots.add(root)
@@ -95,16 +115,25 @@ class FatigueSetClientManager:
                                 )
                                 t.start()
 
-            time.sleep(SCAN_EVERY_SECONDS)
+            time.sleep(scan_every_seconds)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FatigueSet IoT client - stream CSV -> POST /data")
+    parser.add_argument("--base", default="fatigueset", help="Directory base dataset (default: ./fatigueset)")
+    parser.add_argument("--server-url", required=True,
+                        help="URL completo endpoint /data (es: https://<PROJECT_ID>.<REGION>.r.appspot.com/data)")
+    parser.add_argument("--scan-every", type=int, default=5, help="Secondi tra scansioni directory (default 5)")
+    parser.add_argument("--timeout", type=int, default=5, help="Timeout HTTP (default 5s)")
+    args = parser.parse_args()
+
+    mgr = FatigueSetClientManager(args.server_url, timeout_s=args.timeout)
+    try:
+        mgr.monitor_directory(args.base, scan_every_seconds=args.scan_every)
+    except KeyboardInterrupt:
+        print("\n[STOP] interrotto dall'utente.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    # Usage:
-    # python client_iot.py /path/to/fatigueset
-    # se non passi argomenti, usa ./fatigueset
-    base = sys.argv[1] if len(sys.argv) > 1 else "fatigueset"
-    mgr = FatigueSetClientManager(SERVER_URL)
-    try:
-        mgr.monitor_directory(base)
-    except KeyboardInterrupt:
-        print("\n[STOP] interrotto dall'utente.")
+    main()

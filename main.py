@@ -1,25 +1,39 @@
 import os
+import logging
 from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
+
 from flask import Flask, request, jsonify, render_template_string
 from google.cloud import firestore
+from google.api_core.exceptions import GoogleAPICallError
 
 app = Flask(__name__)
 
-# main.py (server completo + dashboard + API JSON)
+# Logging utile sia in Cloud Shell che su App Engine (Log Explorer)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("pcloud")
 
-# Predisposizione futura: config centralizzata (es. ruoli, soglie, ecc.)
+# Nome progetto (utile per debug)
 app.config["PROJECT_NAME"] = os.getenv("GOOGLE_CLOUD_PROJECT", "local")
 
+# Firestore client (ADC in Cloud Shell / service account in App Engine)
 db = firestore.Client()
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _parse_timestamp_to_ms(ts_raw):
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _parse_timestamp_to_ms(ts_raw: Any) -> Optional[int]:
     """
     FatigueSet tipicamente ha timestamp in millisecondi.
     Accettiamo anche secondi (o stringhe), e normalizziamo in ms.
     """
+    if ts_raw is None:
+        return None
     try:
         ts = float(ts_raw)
     except Exception:
@@ -31,9 +45,11 @@ def _parse_timestamp_to_ms(ts_raw):
         return int(ts)
     return int(ts * 1000)
 
-def _doc_path(user, session_id, sensor, timestamp_ms_str):
+
+def _doc_path(user: str, session_id: str, sensor: str, timestamp_ms_str: str) -> firestore.DocumentReference:
     """
-    Struttura Firestore (valida) equivalente a sensors/{user}/{session}/{sensor}/{timestamp}.
+    Struttura Firestore:
+      sensors/{user}/sessions/{session}/sensors/{sensor}/readings/{timestamp_ms}
     """
     return (
         db.collection("sensors").document(user)
@@ -42,55 +58,91 @@ def _doc_path(user, session_id, sensor, timestamp_ms_str):
           .collection("readings").document(timestamp_ms_str)
     )
 
-# ===========================
-# (PUNTO 2) Ingest API
-# ===========================
-@app.route("/data", methods=["POST"])
-def ingest():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"status": "error", "message": "Missing JSON body"}), 400
 
-    # Payload atteso (come da tuoi client attuali)
-    # {
-    #   "user": "01", "session": "02", "sensor": "ACC",
-    #   "timestamp": "1630411794250", "data": { ... }
-    # }
-    try:
-        user = str(data["user"])
-        session_id = str(data["session"])
-        sensor = str(data["sensor"])
-        ts_raw = data["timestamp"]
-        values = data["data"]
-    except KeyError as e:
-        return jsonify({"status": "error", "message": f"Missing field: {e}"}), 400
+def _normalize_payload(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Payload atteso:
+      {
+        "user": "01",
+        "session": "02",
+        "sensor": "ACC",
+        "timestamp": "1630411794250",   # opzionale
+        "data": {...}                  # richiesto
+      }
+    """
+    for k in ("user", "session", "sensor", "data"):
+        if k not in data:
+            return None, f"Missing field: {k}"
 
-    ts_ms = _parse_timestamp_to_ms(ts_raw)
+    user = str(data["user"]).strip()
+    session_id = str(data["session"]).strip()
+    sensor = str(data["sensor"]).strip()
+    values = data["data"]
+
+    if not user or not session_id or not sensor:
+        return None, "user/session/sensor must be non-empty strings"
+    if not isinstance(values, dict):
+        return None, "data must be an object (JSON dict)"
+
+    ts_ms = _parse_timestamp_to_ms(data.get("timestamp"))
     if ts_ms is None:
-        return jsonify({"status": "error", "message": "Invalid timestamp"}), 400
+        ts_ms = _now_ms()
 
-    ts_ms_str = str(ts_ms)
-    now = datetime.now(timezone.utc)
-
-    # Documento reading
-    ref = _doc_path(user, session_id, sensor, ts_ms_str)
-    ref.set({
+    return {
         "user": user,
         "session": session_id,
         "sensor": sensor,
         "timestamp_ms": ts_ms,
         "values": values,
-        "ingested_at": now,
-    })
+    }, None
 
-    # Predisposizione futura:
-    # - potrai aggiungere statistiche aggregate in documenti summary
-    # - potrai inserire controllo soglie/anomalie e salvare in /anomalies
+
+# ===========================
+# Ingest API
+# ===========================
+@app.route("/data", methods=["POST"])
+def ingest():
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"status": "error", "message": "Missing JSON body"}), 400
+
+    normalized, err = _normalize_payload(body)
+    if err:
+        return jsonify({"status": "error", "message": err}), 400
+
+    user = normalized["user"]
+    session_id = normalized["session"]
+    sensor = normalized["sensor"]
+    ts_ms = normalized["timestamp_ms"]
+    values = normalized["values"]
+
+    ref = _doc_path(user, session_id, sensor, str(ts_ms))
+
+    doc = {
+        "user": user,
+        "session": session_id,
+        "sensor": sensor,
+        "timestamp_ms": ts_ms,
+        "values": values,
+        # timestamp robusto server-side
+        "ingested_at": firestore.SERVER_TIMESTAMP,
+    }
+
+    try:
+        # merge=True -> idempotente se arriva lo stesso doc_id
+        ref.set(doc, merge=True)
+    except GoogleAPICallError as e:
+        logger.exception("Firestore write failed: %s", e)
+        return jsonify({"status": "error", "message": "Firestore write failed"}), 500
+    except Exception as e:
+        logger.exception("Unexpected ingest error: %s", e)
+        return jsonify({"status": "error", "message": "Internal error"}), 500
+
     return jsonify({"status": "ok"}), 200
 
 
 # ===========================
-# Dashboard WEB (legge davvero da Firestore)
+# Dashboard HTML
 # ===========================
 DASHBOARD_HTML = """
 <!doctype html>
@@ -103,18 +155,21 @@ DASHBOARD_HTML = """
     body { font-family: Segoe UI, Arial, sans-serif; background:#f6f7fb; margin:0; padding:20px; }
     .card { background:white; border-radius:12px; padding:16px; box-shadow:0 6px 18px rgba(0,0,0,.06); }
     h1 { margin:0 0 10px; color:#1a73e8; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; margin:12px 0; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; margin:12px 0; align-items:center; }
     input { padding:10px; border:1px solid #d0d7de; border-radius:8px; }
+    button { padding:10px 14px; border:0; border-radius:8px; background:#1a73e8; color:white; cursor:pointer; }
     .muted { color:#666; font-size:.9em; }
     pre { white-space: pre-wrap; word-wrap: break-word; background:#0b1020; color:#e6edf3; padding:12px; border-radius:10px; overflow:auto; }
     a { color:#1a73e8; text-decoration:none; }
+    code { background:#eef2ff; padding:2px 6px; border-radius:6px; }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>✅ Dati realmente salvati su Firestore</h1>
+    <h1>✅ Dati salvati su Firestore</h1>
     <div class="muted">
-      Auto-refresh ogni 10s. Filtri opzionali: user, session, sensor. (Query su Firestore, non cache.)
+      Auto-refresh ogni 10s. Filtri opzionali: <code>user</code>, <code>session</code>, <code>sensor</code>.
+      API JSON: <a href="/api/latest">/api/latest</a>
     </div>
 
     <form class="row" method="get" action="/">
@@ -122,14 +177,8 @@ DASHBOARD_HTML = """
       <input name="session" placeholder="session (es. 02)" value="{{ session or '' }}">
       <input name="sensor" placeholder="sensor (es. ACC)" value="{{ sensor or '' }}">
       <input name="limit" placeholder="limit (default 50)" value="{{ limit or '' }}">
-      <button style="padding:10px 14px; border:0; border-radius:8px; background:#1a73e8; color:white; cursor:pointer;">
-        Applica
-      </button>
+      <button type="submit">Applica</button>
     </form>
-
-    <div class="muted">
-      API JSON: <a href="/api/latest">/api/latest</a>
-    </div>
 
     <h3>Ultime letture</h3>
     <pre>{{ lines }}</pre>
@@ -138,17 +187,20 @@ DASHBOARD_HTML = """
 </html>
 """
 
+
 @app.route("/", methods=["GET"])
 def dashboard():
     user = request.args.get("user") or None
     session_id = request.args.get("session") or None
     sensor = request.args.get("sensor") or None
     limit = int(request.args.get("limit") or 50)
+    limit = max(1, min(limit, 500))
 
-    # Query efficiente: collection group su "readings"
-    # (funziona perché tutti i reading stanno in subcollection "readings")
-    q = db.collection_group("readings").order_by("timestamp_ms", direction=firestore.Query.DESCENDING).limit(limit)
-
+    q = (
+        db.collection_group("readings")
+          .order_by("timestamp_ms", direction=firestore.Query.DESCENDING)
+          .limit(limit)
+    )
     if user:
         q = q.where("user", "==", user)
     if session_id:
@@ -156,14 +208,27 @@ def dashboard():
     if sensor:
         q = q.where("sensor", "==", sensor)
 
-    docs = q.stream()
+    try:
+        docs = q.stream()
+    except Exception as e:
+        logger.exception("Firestore query failed (maybe missing index): %s", e)
+        return render_template_string(
+            DASHBOARD_HTML,
+            user=user, session=session_id, sensor=sensor, limit=limit,
+            lines="Errore query Firestore (possibile indice mancante o permessi). Controlla i log."
+        )
 
     lines = []
     for d in docs:
-        x = d.to_dict()
-        # timestamp visualizzabile
-        dt = datetime.fromtimestamp(x["timestamp_ms"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        lines.append(f'USER:{x["user"]} | SESSION:{x["session"]} | SENSOR:{x["sensor"]} | {dt} | values={x["values"]}')
+        x = d.to_dict() or {}
+        ts = x.get("timestamp_ms")
+        try:
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            dt = "N/A"
+        lines.append(
+            f'USER:{x.get("user")} | SESSION:{x.get("session")} | SENSOR:{x.get("sensor")} | {dt} | values={x.get("values")}'
+        )
 
     return render_template_string(
         DASHBOARD_HTML,
@@ -173,12 +238,17 @@ def dashboard():
 
 
 # ===========================
-# API JSON (predisposizione grafici futuri)
+# API JSON
 # ===========================
 @app.route("/api/latest", methods=["GET"])
 def api_latest():
     limit = int(request.args.get("limit") or 50)
-    q = db.collection_group("readings").order_by("timestamp_ms", direction=firestore.Query.DESCENDING).limit(limit)
+    limit = max(1, min(limit, 500))
+    q = (
+        db.collection_group("readings")
+          .order_by("timestamp_ms", direction=firestore.Query.DESCENDING)
+          .limit(limit)
+    )
     docs = [d.to_dict() for d in q.stream()]
     return jsonify(docs), 200
 
@@ -189,5 +259,6 @@ def health():
 
 
 if __name__ == "__main__":
-    # In locale: python main.py
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    # Locale / Cloud Shell: python main.py
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)
