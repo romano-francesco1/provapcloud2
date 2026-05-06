@@ -1,0 +1,13 @@
+sudo apt update
+sudo apt install -y python3-venv python3-pip
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install flask gunicorn google-cloud-firestore
+
+export PORT=8080
+python main.py
+
+DAL MIO PC:
+python client_iot.py --base ./fatigueset --server-base http://<VM_EXTERNAL_IP> --endpoint /data

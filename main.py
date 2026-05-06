@@ -7,20 +7,50 @@ from flask import Flask, request, jsonify, render_template_string
 from google.cloud import firestore
 from google.api_core.exceptions import GoogleAPICallError
 
+# ===========================
+# App & Logging
+# ===========================
 app = Flask(__name__)
 
-# Logging utile sia in Cloud Shell che su App Engine (Log Explorer)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger("pcloud")
+logger = logging.getLogger("fatigue-server")
 
-# Nome progetto (utile per debug)
-app.config["PROJECT_NAME"] = os.getenv("GOOGLE_CLOUD_PROJECT", "local")
+# ===========================
+# Config (VM-friendly)
+# ===========================
+PORT = int(os.getenv("PORT", "8080"))  # pattern comune su esempi corso: 8080 [1](https://github.com/mmamei/PervasiveCloud/blob/master/Lezione%2013%20-%20PubSub/pubsub_app/main.py)
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT")  # su VM di solito è settato
+FIRESTORE_DATABASE = os.getenv("FIRESTORE_DATABASE")  # opzionale, tipicamente "(default)" implicito
+INGEST_API_KEY = os.getenv("INGEST_API_KEY")  # se valorizzata, richiede header X-API-Key
 
-# Firestore client (ADC in Cloud Shell / service account in App Engine)
-db = firestore.Client()
+# ===========================
+# Firestore client (ADC)
+# ===========================
+def get_db() -> firestore.Client:
+    """
+    Crea (lazy) un client Firestore usando Application Default Credentials.
+    Su Compute Engine con service account attaccato, funziona senza key file. [4](https://oneuptime.com/blog/post/2026-02-17-how-to-set-up-a-firestore-database-in-native-mode-using-the-google-cloud-console/view)
+    """
+    # Cache semplice sul contesto app
+    if "FIRESTORE_CLIENT" in app.config:
+        return app.config["FIRESTORE_CLIENT"]
+
+    try:
+        # Alcune versioni della libreria supportano database=...
+        if FIRESTORE_DATABASE:
+            db = firestore.Client(project=PROJECT_ID, database=FIRESTORE_DATABASE)  # type: ignore
+        else:
+            db = firestore.Client(project=PROJECT_ID) if PROJECT_ID else firestore.Client()
+    except TypeError:
+        # Fallback per versioni più vecchie (senza parametro database)
+        db = firestore.Client(project=PROJECT_ID) if PROJECT_ID else firestore.Client()
+
+    app.config["FIRESTORE_CLIENT"] = db
+    logger.info("Firestore client initialized (project=%s, db=%s)", PROJECT_ID, FIRESTORE_DATABASE or "(default)")
+    return db
 
 
 def _now_ms() -> int:
@@ -29,8 +59,7 @@ def _now_ms() -> int:
 
 def _parse_timestamp_to_ms(ts_raw: Any) -> Optional[int]:
     """
-    FatigueSet tipicamente ha timestamp in millisecondi.
-    Accettiamo anche secondi (o stringhe), e normalizziamo in ms.
+    Accetta timestamp in ms o seconds, normalizza in ms.
     """
     if ts_raw is None:
         return None
@@ -39,14 +68,12 @@ def _parse_timestamp_to_ms(ts_raw: Any) -> Optional[int]:
     except Exception:
         return None
 
-    # Se > 1e12 probabilmente sono ms (es. 1630411794250)
-    # Se ~1e9 probabilmente sono seconds
-    if ts > 1e12:
+    if ts > 1e12:  # molto probabilmente già ms
         return int(ts)
     return int(ts * 1000)
 
 
-def _doc_path(user: str, session_id: str, sensor: str, timestamp_ms_str: str) -> firestore.DocumentReference:
+def _doc_path(db: firestore.Client, user: str, session_id: str, sensor: str, ts_ms: int) -> firestore.DocumentReference:
     """
     Struttura Firestore:
       sensors/{user}/sessions/{session}/sensors/{sensor}/readings/{timestamp_ms}
@@ -55,18 +82,18 @@ def _doc_path(user: str, session_id: str, sensor: str, timestamp_ms_str: str) ->
         db.collection("sensors").document(user)
           .collection("sessions").document(session_id)
           .collection("sensors").document(sensor)
-          .collection("readings").document(timestamp_ms_str)
+          .collection("readings").document(str(ts_ms))
     )
 
 
 def _normalize_payload(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Payload atteso:
+    Payload atteso (come il tuo):
       {
         "user": "01",
         "session": "02",
         "sensor": "ACC",
-        "timestamp": "1630411794250",   # opzionale
+        "timestamp": "1630411794250",  # opzionale
         "data": {...}                  # richiesto
       }
     """
@@ -84,9 +111,7 @@ def _normalize_payload(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], 
     if not isinstance(values, dict):
         return None, "data must be an object (JSON dict)"
 
-    ts_ms = _parse_timestamp_to_ms(data.get("timestamp"))
-    if ts_ms is None:
-        ts_ms = _now_ms()
+    ts_ms = _parse_timestamp_to_ms(data.get("timestamp")) or _now_ms()
 
     return {
         "user": user,
@@ -97,11 +122,28 @@ def _normalize_payload(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], 
     }, None
 
 
+def _check_api_key() -> bool:
+    """
+    Se INGEST_API_KEY è impostata, richiede header X-API-Key.
+    """
+    if not INGEST_API_KEY:
+        return True
+    return request.headers.get("X-API-Key") == INGEST_API_KEY
+
+
 # ===========================
-# Ingest API
+# Routes
 # ===========================
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+
 @app.route("/data", methods=["POST"])
 def ingest():
+    if not _check_api_key():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"status": "error", "message": "Missing JSON body"}), 400
@@ -110,13 +152,15 @@ def ingest():
     if err:
         return jsonify({"status": "error", "message": err}), 400
 
+    db = get_db()
+
     user = normalized["user"]
     session_id = normalized["session"]
     sensor = normalized["sensor"]
     ts_ms = normalized["timestamp_ms"]
     values = normalized["values"]
 
-    ref = _doc_path(user, session_id, sensor, str(ts_ms))
+    ref = _doc_path(db, user, session_id, sensor, ts_ms)
 
     doc = {
         "user": user,
@@ -124,13 +168,11 @@ def ingest():
         "sensor": sensor,
         "timestamp_ms": ts_ms,
         "values": values,
-        # timestamp robusto server-side
         "ingested_at": firestore.SERVER_TIMESTAMP,
     }
 
     try:
-        # merge=True -> idempotente se arriva lo stesso doc_id
-        ref.set(doc, merge=True)
+        ref.set(doc, merge=True)  # idempotente sul doc_id=timestamp
     except GoogleAPICallError as e:
         logger.exception("Firestore write failed: %s", e)
         return jsonify({"status": "error", "message": "Firestore write failed"}), 500
@@ -142,7 +184,7 @@ def ingest():
 
 
 # ===========================
-# Dashboard HTML
+# Dashboard HTML (semplice)
 # ===========================
 DASHBOARD_HTML = """
 <!doctype html>
@@ -196,6 +238,8 @@ def dashboard():
     limit = int(request.args.get("limit") or 50)
     limit = max(1, min(limit, 500))
 
+    db = get_db()
+
     q = (
         db.collection_group("readings")
           .order_by("timestamp_ms", direction=firestore.Query.DESCENDING)
@@ -215,7 +259,7 @@ def dashboard():
         return render_template_string(
             DASHBOARD_HTML,
             user=user, session=session_id, sensor=sensor, limit=limit,
-            lines="Errore query Firestore (possibile indice mancante o permessi). Controlla i log."
+            lines="Errore query Firestore (possibile indice mancante). Controlla i log."
         )
 
     lines = []
@@ -237,13 +281,11 @@ def dashboard():
     )
 
 
-# ===========================
-# API JSON
-# ===========================
 @app.route("/api/latest", methods=["GET"])
 def api_latest():
     limit = int(request.args.get("limit") or 50)
     limit = max(1, min(limit, 500))
+    db = get_db()
     q = (
         db.collection_group("readings")
           .order_by("timestamp_ms", direction=firestore.Query.DESCENDING)
@@ -253,12 +295,6 @@ def api_latest():
     return jsonify(docs), 200
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
-
-
 if __name__ == "__main__":
-    # Locale / Cloud Shell: python main.py
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Su VM: esponi su 0.0.0.0 e porta 8080 (pattern corso) [1](https://github.com/mmamei/PervasiveCloud/blob/master/Lezione%2013%20-%20PubSub/pubsub_app/main.py)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
