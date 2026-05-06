@@ -6,6 +6,14 @@ source .venv/bin/activate
 pip install -U pip
 pip install flask gunicorn google-cloud-firestore
 
+sudo apt install -y git
+git --version
+
+cd ~
+git clone https://github.com/mmamei/PervasiveCloud.git
+git clone https://github.com/romano-francesco1/provapcloud2.git
+cd PervasiveCloud
+
 export PORT=8080
 python main.py
 
