@@ -13,6 +13,7 @@ cd ~
 git clone https://github.com/mmamei/PervasiveCloud.git
 git clone https://github.com/romano-francesco1/provapcloud2.git
 cd PervasiveCloud
+cd provapcloud2
 
 export PORT=8080
 python main.py
